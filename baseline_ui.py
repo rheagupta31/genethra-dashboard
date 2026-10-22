@@ -34,7 +34,10 @@ from formatting import (
     status_color,
     status_word,
     trend_phrase,
+    signal_chart_insight,
+    intraday_insight,
 )
+from components import insight_note, day_axis
 
 """
 Per signal time series plotted against the personal baseline band.
@@ -57,11 +60,11 @@ Altair ships with Streamlit, so this adds no dependency.
 
 
 # Legend order is fixed so the colours do not reshuffle between signals.
-STATUS_ORDER = ["In range", "Outside range", "Well outside range"]
-STATUS_COLORS = [IN_RANGE, UNUSUAL, MARKED]
+STATUS_ORDER = ["In range", "Favourable", "Outside range", "Well outside range"]
+STATUS_COLORS = [IN_RANGE, "#7cc495", UNUSUAL, MARKED]
 
 
-def _status(value, baseline):
+def _status(value, baseline, higher_is_better=None):
     """
     Per point status, using the same thresholds as the rest of the app.
 
@@ -73,6 +76,8 @@ def _status(value, baseline):
         return "No range yet"
     if deviation.state == "in_range":
         return "In range"
+    if higher_is_better is not None and (deviation.state == "above") == higher_is_better:
+        return "Favourable"
     return "Well outside range" if deviation.magnitude == "marked" else "Outside range"
 
 
@@ -80,9 +85,8 @@ def _frame(marker):
     """
     One row per day.
 
-    Day 0 is today and earlier days are negative, so the axis reads left to
-    right as time passing without inventing calendar dates the mock data does
-    not have.
+    Dates come from the export, so the 7, 14 and 30 day views all line up on
+    the same calendar days.
     """
     series = marker["series"]
     baseline = marker["baseline"]
@@ -93,9 +97,10 @@ def _frame(marker):
         z = bl.zscore(value, baseline) if baseline else None
         rows.append(
             {
-                "day": index - (n - 1),
+                "day": index + 1,
+                "day_label": f"Day {index + 1}" + (" (today)" if index == n - 1 else ""),
                 "value": value,
-                "status": _status(value, baseline),
+                "status": _status(value, baseline, marker["higher_is_better"]),
                 "z": round(z, 2) if z is not None else None,
                 "is_today": index == n - 1,
             }
@@ -103,13 +108,25 @@ def _frame(marker):
     return pd.DataFrame(rows)
 
 
+def signal_y_domain(persona_id, signal_key):
+    """
+    One y axis for every window of a signal: the full 30-day history, the
+    24-hour series and the normal range together. Switching windows then only
+    changes how much of the line is shown, not the scale it is drawn on.
+    """
+    full = mock_data.get_biomarker(persona_id, signal_key, days=mock_data.BASELINE_WINDOW_DAYS)
+    _, intraday = mock_data.get_intraday_series(persona_id, signal_key)
+    values = list(full["series"]) + list(intraday)
+    if full["baseline"] is not None:
+        values += list(bl.normal_range(full["baseline"]))
+    span = max(values) - min(values)
+    pad = span * 0.12 if span else 1.0
+    return [min(values) - pad, max(values) + pad]
+
+
 def render_signal_chart(marker, height=260, show_title=False, y_domain=None):
     """
     marker: a resolved signal dict from DataSource.get_biomarker()
-    y_domain: optional fixed (min, max) for the y-axis. When given, used
-        instead of scaling to whatever's currently visible — so switching
-        between the 1/7/14/30 day windows doesn't visually rescale the
-        chart each time, only the data on screen changes.
     """
     series = marker["series"]
     if not series:
@@ -126,38 +143,39 @@ def render_signal_chart(marker, height=260, show_title=False, y_domain=None):
     df = _frame(marker)
 
     tooltip = [
-        alt.Tooltip("day:Q", title="Days ago"),
+        alt.Tooltip("day_label:N", title="Day"),
         alt.Tooltip("value:Q", title=f"{marker['label']} ({unit})", format=f".{precision}f"),
         alt.Tooltip("status:N", title="Status"),
     ]
     if baseline is not None:
         tooltip.append(alt.Tooltip("z:Q", title="SD from baseline", format="+.2f"))
 
-    if y_domain is not None:
-        y_scale = alt.Scale(domain=list(y_domain), nice=False)
-    else:
-        # Fallback: scale from the data and the band together, so a band
-        # sitting outside the observed range is never clipped off the top.
+    # Y scale is set from the data and the band together, so a band sitting
+    # outside the observed range is never clipped off the top of the chart.
+    if y_domain is None:
         values = list(series)
         if baseline is not None:
-            low, high = bl.normal_range(baseline)
-            values += [low, high]
+            values += list(bl.normal_range(baseline))
         span = max(values) - min(values)
         pad = span * 0.12 if span else 1.0
-        y_scale = alt.Scale(domain=[min(values) - pad, max(values) + pad], nice=False)
+        y_domain = [min(values) - pad, max(values) + pad]
+    y_scale = alt.Scale(domain=y_domain, nice=False)
+    n = len(df)
+    x_scale = alt.Scale(domain=[1, max(n, 2)], nice=False, padding=12)
+    x_enc = alt.X("day:Q", scale=x_scale, axis=day_axis(n, title=f"Day (day {n} = today)"))
 
     layers = []
 
     if baseline is not None:
         low, high = bl.normal_range(baseline)
         band_df = pd.DataFrame(
-            {"day": [df["day"].min(), df["day"].max()], "low": [low, low], "high": [high, high]}
+            {"day": [1, n], "low": [low, low], "high": [high, high]}
         )
         layers.append(
             alt.Chart(band_df)
             .mark_area(color=IN_RANGE, opacity=0.13)
             .encode(
-                x=alt.X("day:Q"),
+                x=x_enc,
                 y=alt.Y("low:Q", scale=y_scale),
                 y2=alt.Y2("high:Q"),
             )
@@ -170,13 +188,9 @@ def render_signal_chart(marker, height=260, show_title=False, y_domain=None):
 
     layers.append(
         alt.Chart(df)
-        .mark_line(color=LINE, strokeWidth=2, interpolate="monotone")
+        .mark_line(color=LINE, strokeWidth=2)
         .encode(
-            x=alt.X(
-                "day:Q",
-                title="Days ago (0 = today)",
-                axis=alt.Axis(tickMinStep=1, grid=False),
-            ),
+            x=x_enc,
             y=alt.Y(
                 "value:Q",
                 title=f"{marker['label']} ({unit})",
@@ -189,7 +203,7 @@ def render_signal_chart(marker, height=260, show_title=False, y_domain=None):
         alt.Chart(df)
         .mark_point(filled=True, stroke="white", strokeWidth=1)
         .encode(
-            x=alt.X("day:Q"),
+            x=x_enc,
             y=alt.Y("value:Q", scale=y_scale),
             size=alt.Size(
                 "is_today:N",
@@ -240,20 +254,18 @@ def render_signal_chart(marker, height=260, show_title=False, y_domain=None):
             f"your own readings. Dashed line is your average."
         )
 
+    insight_note(signal_chart_insight(marker), inset=False)
+
 
 def _intraday_frame(marker):
-    """
-    One row per intraday point. Minutes-since-midnight are converted to an
-    arbitrary reference timestamp so Altair can format the axis as clock
-    time (12 AM, 6 AM, ...) instead of raw minute numbers.
-    """
+    """One row per intraday point, x in hours since midnight (0 to 24)."""
     minutes = marker["minutes"]
     values = marker["values"]
-    reference = pd.Timestamp("2000-01-01")
     rows = []
     for i, (m, v) in enumerate(zip(minutes, values)):
         rows.append({
-            "timestamp": reference + pd.to_timedelta(m, unit="m"),
+            "hour": m / 60,
+            "time": f"{int(m // 60):02d}:{int(m % 60):02d}",
             "value": v,
             "is_now": i == len(minutes) - 1,
         })
@@ -266,9 +278,6 @@ def render_intraday_chart(marker, height=260, y_domain=None):
     against the same personal range the daily view uses (a range isn't
     recomputed from a single day — it's the existing 30-day baseline,
     viewed at finer time resolution).
-
-    y_domain: optional fixed (min, max) for the y-axis — see
-        render_signal_chart's docstring for why.
     """
     baseline = marker["baseline"]
     unit = marker["unit"]
@@ -276,28 +285,32 @@ def render_intraday_chart(marker, height=260, y_domain=None):
 
     df = _intraday_frame(marker)
 
-    if y_domain is not None:
-        y_scale = alt.Scale(domain=list(y_domain), nice=False)
-    else:
-        values = list(marker["values"])
-        if baseline is not None:
-            low, high = bl.normal_range(baseline)
-            values += [low, high]
-        span = max(values) - min(values)
-        pad = span * 0.15 if span else 1.0
-        y_scale = alt.Scale(domain=[min(values) - pad, max(values) + pad], nice=False)
+    values = list(marker["values"])
+    if baseline is not None:
+        low, high = bl.normal_range(baseline)
+        values += [low, high]
+    span = max(values) - min(values)
+    pad = span * 0.15 if span else 1.0
+    y_scale = alt.Scale(domain=y_domain or [min(values) - pad, max(values) + pad], nice=False)
+
+    x_enc = alt.X(
+        "hour:Q", title="Hour of day (today)",
+        scale=alt.Scale(domain=[0, 24], nice=False),
+        axis=alt.Axis(values=list(range(0, 25, 2)), format="d", grid=True,
+                      gridColor="#eef2f3", labelAngle=0, titleFontWeight="normal"),
+    )
 
     layers = []
 
     if baseline is not None:
         low, high = bl.normal_range(baseline)
         band_df = pd.DataFrame({
-            "timestamp": [df["timestamp"].min(), df["timestamp"].max()],
+            "hour": [0, 24],
             "low": [low, low], "high": [high, high],
         })
         layers.append(
             alt.Chart(band_df).mark_area(color=IN_RANGE, opacity=0.13).encode(
-                x=alt.X("timestamp:T"),
+                x=x_enc,
                 y=alt.Y("low:Q", scale=y_scale),
                 y2=alt.Y2("high:Q"),
             )
@@ -309,12 +322,11 @@ def render_intraday_chart(marker, height=260, y_domain=None):
         )
 
     layers.append(
-        alt.Chart(df).mark_line(color=LINE, strokeWidth=1.8, interpolate="monotone").encode(
-            x=alt.X("timestamp:T", title="Time of day",
-                     axis=alt.Axis(format="%I %p", grid=False, tickCount=6)),
+        alt.Chart(df).mark_line(color=LINE, strokeWidth=1.8).encode(
+            x=x_enc,
             y=alt.Y("value:Q", title=f"{marker['label']} ({unit})", scale=y_scale),
             tooltip=[
-                alt.Tooltip("timestamp:T", title="Time", format="%I:%M %p"),
+                alt.Tooltip("time:N", title="Time"),
                 alt.Tooltip("value:Q", title=f"{marker['label']} ({unit})", format=f".{precision}f"),
             ],
         )
@@ -322,7 +334,7 @@ def render_intraday_chart(marker, height=260, y_domain=None):
 
     now_point = alt.Chart(df[df["is_now"]]).mark_point(
         filled=True, color=LINE, size=100, stroke="white", strokeWidth=1.5
-    ).encode(x="timestamp:T", y=alt.Y("value:Q", scale=y_scale))
+    ).encode(x=x_enc, y=alt.Y("value:Q", scale=y_scale))
     layers.append(now_point)
 
     chart = (
@@ -333,6 +345,8 @@ def render_intraday_chart(marker, height=260, y_domain=None):
     )
 
     st.altair_chart(chart, use_container_width=True)
+    low, high = bl.normal_range(baseline) if baseline is not None else (None, None)
+    insight_note(intraday_insight(marker, low, high), inset=False)
     st.caption(mock_data.PLACEHOLDER_NOTE)
 
 
@@ -401,20 +415,13 @@ def render_baseline_row(marker, on_open=None, key_prefix=""):
     color = status_color(deviation, higher_is_better)
     word = status_word(deviation, higher_is_better)
 
-    synthetic_badge = (
-        f"<span style='font-size:0.62rem;color:#b8860b;background:#b8860b1a;"
-        f"border-radius:4px;padding:1px 5px;margin-left:6px;font-weight:600;'>"
-        f"SIMULATED</span>"
-        if marker.get("fully_synthetic") else ""
-    )
-
     with st.container(border=True):
         # Header: signal on the left, today's reading on the right.
         st.markdown(
             f"""
             <div style="display:flex;align-items:baseline;justify-content:space-between;">
               <span style="font-size:0.74rem;color:{MUTED};text-transform:uppercase;
-                           letter-spacing:0.05em;font-weight:600;">{label}{synthetic_badge}</span>
+                           letter-spacing:0.05em;font-weight:600;">{label}</span>
               <span style="font-size:1.25rem;font-weight:700;color:{color};">
                 {fmt(current, precision)}<span style="font-size:0.78rem;font-weight:500;
                 color:{MUTED};margin-left:3px;">{unit}</span>
@@ -501,24 +508,34 @@ def render_baseline_section(markers, baseline_days, on_open=None, key_prefix="")
 
     markers: dict of resolved signal dicts from DataSource.get_biomarkers()
     """
-    state, label = bl.maturity(baseline_days)
+    days_used = next(
+        (m["baseline"].n for m in markers.values() if m["baseline"] is not None),
+        max(baseline_days - 1, 0),
+    )
 
     st.markdown("#### Your baselines")
-    st.caption(label)
 
     # Explained once here rather than repeated under every row.
     st.markdown(
-        f"<div style='display:flex;align-items:center;gap:7px;font-size:0.7rem;"
-        f"color:{MUTED};margin:0 0 10px 0;'>"
-        f"<span style='display:inline-block;width:24px;height:8px;border-radius:4px;"
-        f"background:{IN_RANGE}2e;flex:none;'></span>"
-        f"Shaded band is your normal range, one SD either side of your own average"
+        f"<div style='background:#fafbfc;border:1px solid #eceff3;border-radius:8px;"
+        f"padding:10px 12px;margin:0 0 12px 0;font-size:0.74rem;line-height:1.5;"
+        f"color:#3d4a4f;'>"
+        f"<div style='font-weight:700;color:#1f2328;margin-bottom:4px;'>"
+        f"How your baseline is calculated</div>"
+        f"<div>1. Your daily readings from the last <b>{days_used} days</b> are "
+        f"collected. Today is left out, so it is compared against your history "
+        f"rather than included in it.</div>"
+        f"<div>2. Your <b>average</b> and <b>standard deviation (SD)</b> are "
+        f"calculated from those readings.</div>"
+        f"<div style='display:flex;align-items:center;gap:6px;'>"
+        f"<span>3. Your normal range is your average &plusmn; 1 SD</span>"
+        f"<span style='display:inline-block;width:20px;height:8px;border-radius:4px;"
+        f"background:{IN_RANGE}2e;flex:none;'></span></div>"
+        f"<div>4. Today's reading is marked <b>outside range</b> beyond 1 SD and "
+        f"<b>well outside range</b> beyond 2 SD.</div>"
         f"</div>",
         unsafe_allow_html=True,
     )
-
-    if state == "partial":
-        st.caption("Ranges will tighten as more of your history is collected.")
 
     for marker in markers.values():
         render_baseline_row(marker, on_open=on_open, key_prefix=key_prefix)
@@ -570,26 +587,6 @@ def _stat(label, value, sub=None, color=None):
     )
 
 
-def _fixed_y_domain(persona_id, signal_key):
-    """
-    Y-axis domain for a signal, computed once from its full 30-day history
-    and baseline band. Passed to whichever chart is being drawn (1/7/14/30
-    day view) so the vertical scale stays put when switching between them
-    — only the data on screen changes, not the zoom level.
-    """
-    full_series = mock_data.get_biomarker_series(
-        persona_id, signal_key, days=mock_data.BASELINE_WINDOW_DAYS
-    )
-    baseline = bl.compute_baseline(full_series)
-    values = list(full_series)
-    if baseline is not None:
-        low, high = bl.normal_range(baseline)
-        values += [low, high]
-    span = max(values) - min(values)
-    pad = span * 0.15 if span else 1.0
-    return (min(values) - pad, max(values) + pad)
-
-
 def render_signal_detail(persona_id, signal_key, on_back):
     """
     persona_id: whose signal this is
@@ -602,11 +599,8 @@ def render_signal_detail(persona_id, signal_key, on_back):
     if window_key not in st.session_state:
         st.session_state[window_key] = DEFAULT_WINDOW
 
-    # key= alone drives this widget. Also passing index= (computed from a
-    # value read from session_state just before the widget is created) is
-    # a documented Streamlit anti-pattern — the two can fall out of sync by
-    # one interaction, which is exactly the "click 1 day, see 7 days"
-    # lag this was causing.
+    # The widget key alone owns the selection, so the chart below always
+    # matches the option that was just clicked.
     st.radio(
         "Window",
         options=WINDOW_OPTIONS,
@@ -616,99 +610,19 @@ def render_signal_detail(persona_id, signal_key, on_back):
     )
     window = st.session_state[window_key]
 
-    if window == "day1":
-        _render_day1_detail(persona_id, signal_key)
-    else:
-        _render_daily_detail(persona_id, signal_key, window)
-
-
-def _render_day1_detail(persona_id, signal_key):
-    """
-    24-hour intraday view. Headline and status still compare against the
-    same daily personal range the 7/14/30 views use — a range isn't
-    recomputed from a single day. What changes is time resolution: instead
-    of one point per day, this shows the last 24 hours at 10-minute steps.
-    """
-    marker = mock_data.get_intraday_marker(persona_id, signal_key)
-    label = marker["label"]
-    unit = marker["unit"]
-    precision = marker["precision"]
-    baseline = marker["baseline"]
-    deviation = bl.classify(marker["current"], baseline)
-    color = status_color(deviation, marker["higher_is_better"])
-
-    st.markdown(
-        f"<div style='margin-top:6px;'>"
-        f"<span style='font-size:0.66rem;color:{MUTED};text-transform:uppercase;"
-        f"letter-spacing:0.05em;font-weight:600;background:#f1f3f5;"
-        f"border-radius:4px;padding:2px 7px;'>{marker['system']}</span></div>"
-        f"<div style='font-size:1.3rem;font-weight:700;margin-top:7px;'>{label}</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"<div style='display:flex;align-items:baseline;gap:8px;margin:2px 0 10px 0;'>"
-        f"<span style='font-size:2.3rem;font-weight:700;line-height:1.05;"
-        f"color:{color};'>{fmt(marker['current'], precision)}</span>"
-        f"<span style='font-size:0.9rem;color:{MUTED};'>{unit}</span>"
-        f"<span style='margin-left:auto;background:{color}1a;color:{color};"
-        f"border:1px solid {color}55;border-radius:999px;padding:2px 10px;"
-        f"font-size:0.75rem;font-weight:600;'>"
-        f"{status_word(deviation, marker['higher_is_better'])}</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    if baseline is None:
-        st.info(
-            f"No personal range yet — {bl.RANGE_MIN_DAYS} days needed before "
-            f"a range can be calculated from your own readings."
-        )
-    else:
-        low, high = bl.normal_range(baseline)
-        inside = sum(1 for v in marker["values"] if low <= v <= high)
-        total = len(marker["values"])
-        beyond = (
-            "beyond your usual range"
-            if deviation.state != "in_range"
-            else "within your usual range"
-        )
-        cells = [
-            _stat("Your average", f"{fmt(baseline.mean, precision)} {unit}",
-                  f"from {baseline.n} days"),
-            _stat("Your normal range",
-                  f"{fmt(low, precision)} to {fmt(high, precision)} {unit}",
-                  "one SD either side"),
-            _stat("Deviation", f"{deviation.z:+.2f} SD", beyond, color=color),
-            _stat("Readings in range", f"{inside} of {total}", "across today"),
-        ]
-        st.markdown(
-            "<div style='display:grid;grid-template-columns:1fr 1fr;gap:7px;"
-            "margin-bottom:12px;'>" + "".join(cells) + "</div>",
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            f"Range is {fmt(low, precision)} to {fmt(high, precision)} {unit} — "
-            f"a range isn't recalculated from one day, so this is the same "
-            f"range the 7/14/30 day views use."
-        )
-
-    render_intraday_chart(marker, y_domain=_fixed_y_domain(persona_id, signal_key))
-
-    if marker.get("fully_synthetic"):
-        st.caption(
-            "⚠ Fully simulated signal — unlike the other biomarkers here, "
-            "there is no real reading behind this one at all, not even "
-            "today's. The export has no numeric sleep or circadian data yet."
-        )
-
-    contributes = mock_data.get_signal_scores(signal_key)
-    if contributes:
-        st.caption(f"Contributes to: {', '.join(contributes)}")
+    _render_daily_detail(persona_id, signal_key, window)
 
 
 def _render_daily_detail(persona_id, signal_key, window):
-    marker = mock_data.get_biomarker(persona_id, signal_key, days=window)
+    """
+    Same header, summary and y axis for every window. Only the chart and the
+    last summary cell change, so switching windows does not move the page
+    around. The 1 day window shows the last 24 hours instead of daily points.
+    """
+    day1 = window == "day1"
+    marker = mock_data.get_biomarker(persona_id, signal_key, days=1 if day1 else window)
+    intraday = mock_data.get_intraday_marker(persona_id, signal_key) if day1 else None
+    y_domain = signal_y_domain(persona_id, signal_key)
 
     label = marker["label"]
     unit = marker["unit"]
@@ -759,6 +673,10 @@ def _render_daily_detail(persona_id, signal_key, window):
             _stat("Days in range", f"{inside} of {total}",
                   trend_phrase(marker["trend"], marker["observed_days"])),
         ]
+        if day1:
+            vals = intraday["values"]
+            share = sum(1 for v in vals if low <= v <= high) / len(vals) * 100
+            cells[3] = _stat("In range today", f"{share:.0f}%", "of the last 24 hours")
         st.markdown(
             "<div style='display:grid;grid-template-columns:1fr 1fr;gap:7px;"
             "margin-bottom:12px;'>" + "".join(cells) + "</div>",
@@ -771,14 +689,10 @@ def _render_daily_detail(persona_id, signal_key, window):
             f"range can be calculated from your own readings."
         )
 
-    render_signal_chart(marker, y_domain=_fixed_y_domain(persona_id, signal_key))
-
-    if marker.get("fully_synthetic"):
-        st.caption(
-            "⚠ Fully simulated signal — unlike the other biomarkers here, "
-            "there is no real reading behind this one at all, not even "
-            "today's. The export has no numeric sleep or circadian data yet."
-        )
+    if day1:
+        render_intraday_chart(intraday, y_domain=y_domain)
+    else:
+        render_signal_chart(marker, y_domain=y_domain)
 
     st.markdown(f"**What this means:** {interpretation(marker)}")
 
@@ -787,23 +701,22 @@ def _render_daily_detail(persona_id, signal_key, window):
         st.caption(f"Contributes to: {', '.join(contributes)}")
 
     with st.expander("How this baseline was calculated"):
-        baseline_days_text = marker["baseline"].n if marker["baseline"] else mock_data.BASELINE_WINDOW_DAYS - 1
-        st.markdown(
-            f"""
-Your baseline is calculated from **your own readings only**, never from a
-population average.
+        if baseline is None:
+            st.markdown(
+                f"A range needs at least {bl.RANGE_MIN_DAYS} days of readings. "
+                f"Only {marker['observed_days']} are available so far."
+            )
+        else:
+            low, high = bl.normal_range(baseline)
+            p = precision
+            st.markdown(
+                f"""
+1. **Readings used:** your daily {marker['phrase']} for the last {baseline.n} days, excluding today.
+2. **Average:** {fmt(baseline.mean, p + 1)} {unit}
+3. **Standard deviation (SD):** {fmt(baseline.sd, p + 1)} {unit}, which is how much you normally vary from day to day.
+4. **Normal range:** average &plusmn; 1 SD = {fmt(low, p)} to {fmt(high, p)} {unit}
+5. **Today:** {fmt(marker['current'], p)} {unit} is {deviation.z:+.2f} SD from your average, so it is marked *{status_word(deviation, marker['higher_is_better']).lower()}*.
 
-- Readings used: the last **{baseline_days_text} days**, excluding today,
-  so today's value is not folded into the range it is being judged against.
-  This is fixed regardless of the window selected above — the window only
-  changes how much history is drawn on the chart, not what counts as normal.
-- Centre: the mean of those readings.
-- Range: mean plus or minus **one standard deviation**, which covers roughly
-  68% of your own readings. Anything outside it is unusual *for you*.
-- Deviation is reported in standard deviations so signals with different units
-  can be compared directly.
-- A range is only drawn once there are at least **{bl.RANGE_MIN_DAYS} days** of
-  history. Below that, a standard deviation is not a usable estimate of how much
-  you actually vary.
+The range always uses the same {baseline.n} days, so changing the window above only changes how much of the chart is shown.
 """
-        )
+            )

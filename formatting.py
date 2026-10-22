@@ -162,3 +162,100 @@ def trend_phrase(trend, days):
         return None
     words = {"rising": "Rising", "falling": "Falling", "stable": "Stable"}
     return f"{words[trend]} across {days} days"
+
+
+def with_unit(value, unit):
+    """Joins a formatted value and its unit. No space before a percent sign."""
+    return f"{value}{unit}" if unit == "%" else f"{value} {unit}"
+
+
+def score_trend_insight(metric, values, higher_is_better, direction):
+    """
+    Short insight under a composite score trend chart.
+
+    direction comes from baseline.trend_direction(), the same rule the Alerts
+    tab uses, so the chart text and the alerts cannot disagree.
+    """
+    n = len(values)
+    first, last = values[0], values[-1]
+    avg = sum(values) / n
+
+    if abs(last - avg) < 1:
+        vs_avg = f"in line with the {n}-day average of {avg:.0f}%"
+    elif last > avg:
+        vs_avg = f"above the {n}-day average of {avg:.0f}%"
+    else:
+        vs_avg = f"below the {n}-day average of {avg:.0f}%"
+
+    if direction in ("rising", "falling"):
+        verb = "risen" if direction == "rising" else "fallen"
+        good = (direction == "rising") == higher_is_better
+        meaning = (
+            "This is a favourable direction for this score."
+            if good
+            else "This is an unfavourable direction and is listed on the Alerts tab."
+        )
+        return (
+            f"{metric} has {verb} {abs(last - first):.0f} points over {n} days, "
+            f"from {first:.0f}% to {last:.0f}%. {meaning}"
+        )
+
+    return (
+        f"{metric} has held steady over {n} days, between {min(values):.0f}% and "
+        f"{max(values):.0f}%. Today's {last:.0f}% is {vs_avg}."
+    )
+
+
+def signal_chart_insight(marker):
+    """Short insight under a signal chart in the drill down."""
+    series = marker["series"]
+    baseline = marker["baseline"]
+    unit = marker["unit"]
+    p = marker["precision"]
+    n = len(series)
+
+    if baseline is None:
+        return (
+            f"{n} days recorded so far. A personal range appears once there is "
+            f"enough history to measure how much this signal normally varies."
+        )
+
+    low_v, high_v = min(series), max(series)
+    spread = (
+        f"Over the last {n} days, readings ranged from {fmt(low_v, p)} to "
+        f"{with_unit(fmt(high_v, p), unit)}"
+    )
+    inside, total = marker["in_range"]
+    outside = total - inside
+    spread += (
+        ", all inside your normal range."
+        if outside == 0
+        else f", with {outside} of {total} days outside your normal range."
+    )
+
+    current = series[-1]
+    if n > 1 and current == high_v and series.count(high_v) == 1:
+        second = "Today's reading is the highest in this window."
+    elif n > 1 and current == low_v and series.count(low_v) == 1:
+        second = "Today's reading is the lowest in this window."
+    elif marker["trend"] in ("rising", "falling"):
+        second = f"The readings show a {marker['trend']} trend across this window."
+    else:
+        second = "There is no clear upward or downward trend across this window."
+
+    return f"{spread} {second}"
+
+
+def intraday_insight(marker, low, high):
+    """Short insight under the 24-hour chart. low/high: the daily normal range."""
+    values = marker["values"]
+    unit = marker["unit"]
+    p = marker["precision"]
+    text = (
+        f"Over the last 24 hours, readings ranged from {fmt(min(values), p)} to "
+        f"{with_unit(fmt(max(values), p), unit)}."
+    )
+    if low is not None:
+        share = sum(1 for v in values if low <= v <= high) / len(values) * 100
+        text += f" {share:.0f}% of readings were inside your daily normal range."
+    return text

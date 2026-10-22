@@ -31,9 +31,8 @@ import pandas as pd
 import baseline as bl
 
 PLACEHOLDER_NOTE = (
-    "Simulated variation — Tristan's export does not yet vary over time, "
-    "so day-to-day and intraday history here is generated around today's "
-    "real reading, not observed."
+    "Sample data: the source export does not yet vary over time, so this "
+    "history is simulated around today's reading."
 )
 
 CSV_PATH = Path(__file__).parent / "One_Minute_Synthetic_TimeSeries.csv"
@@ -53,9 +52,9 @@ def _stable_hash(text: str) -> int:
 def _load():
     df = pd.read_csv(CSV_PATH)
     # Export labels this column Celsius but the values (95.6-98.3) are
-    # actually Fahrenheit. Left as-is here — the app displays this signal
-    # in Fahrenheit, so no conversion is needed; the column name itself is
-    # just the CSV's literal header text, kept so pandas indexing matches.
+    # Fahrenheit. Converting here so downstream math and display are
+    # actually in Celsius, as labeled.
+    df["Body Temperature (celsius)"] = (df["Body Temperature (celsius)"] - 32) * 5 / 9
     return df
 
 
@@ -87,6 +86,18 @@ def get_persona(persona_id: int) -> dict:
 
 
 PERSONAS = [get_persona(pid) for pid in sorted(_demographics().index)]
+
+
+@lru_cache(maxsize=1)
+def last_day():
+    """Last calendar day in the export. Treated as 'today' throughout."""
+    return pd.to_datetime(_load()["Timestamp"].max()).normalize()
+
+
+def series_dates(n: int) -> list:
+    """Calendar dates for an n-day series, oldest first, ending on last_day()."""
+    end = last_day()
+    return [end - pd.Timedelta(days=n - 1 - i) for i in range(n)]
 
 
 def get_days_collected(persona_id: int) -> int:
@@ -250,77 +261,15 @@ BODY_SYSTEMS = ["Cardiovascular", "Autonomic", "Sleep / Circadian", "Metabolic"]
 SYSTEM_STATUS_POOL = ["improving", "stable", "declining"]
 
 
-# Which composite score(s) a body system's status is derived from, where
-# one exists. Cardiovascular Load's own signals (resting_hr, hrv_sdnn) span
-# both the Cardiovascular and Autonomic system tags in BIOMARKER_META, so
-# this mapping is a reasonable-but-imperfect simplification, not a precise
-# taxonomy — same caveat as SCORE_SIGNALS above. Autonomic and Metabolic
-# have no composite score that maps to them, so they're left out here
-# entirely rather than forcing a link that doesn't exist; their status
-# stays randomly generated, same as before.
-SYSTEM_SCORES = {
-    "Cardiovascular": ["Cardiovascular Load"],
-    "Sleep / Circadian": ["Sleep Quality", "Circadian Stability"],
-}
-
-
-def _system_status_from_scores(persona_id: int, score_labels: list[str]):
-    """
-    Derives 'improving' / 'stable' / 'declining' from the real trend
-    direction of the composite score(s) a system maps to — the same
-    statistical test get_alerts() uses, not just the raw first-to-last
-    delta. Adjusted for HIGHER_IS_BETTER so 'improving' always means
-    favorable, not just 'the number went up'. Returns None when no score
-    maps to this system, so the caller falls back to random.
-    """
-    if not score_labels:
-        return None
-
-    votes = []
-    for label in score_labels:
-        trend = get_trend_data(persona_id, label)
-        direction = bl.trend_direction(trend, baseline=bl.compute_baseline(trend))
-        good = HIGHER_IS_BETTER[label]
-        if direction == "rising":
-            votes.append(1 if good else -1)
-        elif direction == "falling":
-            votes.append(-1 if good else 1)
-        else:
-            votes.append(0)
-
-    avg = sum(votes) / len(votes)
-    if avg > 0.25:
-        return "improving"
-    if avg < -0.25:
-        return "declining"
-    return "stable"
-
-
 def get_body_systems_data(persona_id: int) -> dict:
-    # "In scope" is derived from BIOMARKER_META, not hand-maintained — a
-    # system is ready if at least one working signal is tagged to it. This
-    # was previously a hardcoded tuple that said only Cardiovascular and
-    # Sleep/Circadian were ready, which had drifted out of sync with the
-    # Baselines tab: Autonomic (HRV, Respiratory Rate) and Metabolic (Body
-    # Temperature) already had working signals, while Sleep/Circadian had
-    # none. Deriving it here means the two tabs can't disagree again.
-    #
-    # Status is the same idea applied to the Insights tab: where a
-    # composite score maps to a system (see SYSTEM_SCORES), status comes
-    # from that score's real trend, not an independent random draw — this
-    # is exactly what was previously letting Home say "declining" while
-    # Insights showed the same area clearly improving.
-    systems_with_signals = {meta["system"] for meta in BIOMARKER_META.values()}
     rnd = random.Random(persona_id * 51)
-    result = {}
-    for system in BODY_SYSTEMS:
-        derived = _system_status_from_scores(persona_id, SYSTEM_SCORES.get(system, []))
-        status = derived if derived is not None else rnd.choice(SYSTEM_STATUS_POOL)
-        result[system] = {
-            "status": status,
-            "in_scope": system in systems_with_signals,
+    return {
+        system: {
+            "status": rnd.choice(SYSTEM_STATUS_POOL),
+            "in_scope": system in ("Cardiovascular", "Sleep / Circadian"),
         }
-    return result
+        for system in BODY_SYSTEMS
+    }
 
 
 HIGHER_IS_BETTER = {
@@ -380,7 +329,7 @@ BIOMARKER_FIELDS = [
     ("Blood Pressure", "Blood Pressure (mmHg)", "mmHg"),
     ("Respiratory Rate", "Respiratory Rate (breaths/min)", "breaths/min"),
     ("Oxygen Saturation", "Oxygen Saturation (%)", "%"),
-    ("Body Temperature", "Body Temperature (celsius)", "\u00b0F"),
+    ("Body Temperature", "Body Temperature (celsius)", "°C"),
     ("Basal Energy Burned", "Basal Energy Burned (kcal)", "kcal"),
     ("BMI", "BMI Value", "kg/m²"),
 ]
@@ -428,45 +377,13 @@ BIOMARKER_META = {
     },
     "body_temperature": {
         "field": "Body Temperature (celsius)", "label": "Body Temperature",
-        "phrase": "body temperature", "unit": "\u00b0F",
+        "phrase": "body temperature", "unit": "\u00b0C",
         # Prototype convention, same as Ore's original — lower reads as
         # favourable. Worth confirming with Dr. Muhammad, same open item
         # he flagged.
         "higher_is_better": False, "precision": 1, "system": "Metabolic",
     },
-    "sleep_duration": {
-        # No "field" — unlike the five signals above, there is no real
-        # column for this at all. The export's only sleep-related fields
-        # (Sleep Analysis, Sleep State, Activity State) are categorical and
-        # constant ("inBed" / "Awake" / "Sedentary" for every patient,
-        # every minute) — nothing numeric to anchor even today's value to.
-        # So this signal is FULLY invented: not just simulated history
-        # around a real reading, but an invented reading too. Flagged via
-        # fully_synthetic below, and called out separately in the UI.
-        "field": None, "label": "Sleep Duration",
-        "phrase": "sleep duration", "unit": "hrs",
-        "higher_is_better": True, "precision": 1, "system": "Sleep / Circadian",
-        "fully_synthetic": True,
-    },
 }
-
-# Plausible starting point for signals with no real reading to anchor to
-# at all (BIOMARKER_META entries where "field" is None).
-SYNTHETIC_ANCHOR_RANGES = {
-    "sleep_duration": (6.5, 8.2),  # hours — typical adult range
-}
-
-
-def _anchor_value(persona_id: int, marker_key: str, meta: dict) -> float:
-    """Today's reading for a signal. Real, from the export, when the
-    signal has a field. Fully invented — a deterministic per-persona
-    starting point, not derived from anything in the export — when it
-    doesn't."""
-    if meta["field"] is not None:
-        return float(get_persona(persona_id)[meta["field"]])
-    lo, hi = SYNTHETIC_ANCHOR_RANGES[marker_key]
-    rnd = random.Random(persona_id * _stable_hash("anchor" + marker_key))
-    return rnd.uniform(lo, hi)
 
 # Typical within-person day-to-day variation. PROTOTYPE VALUES — should be
 # replaced with dispersion measured from Tristan's real series once it
@@ -476,8 +393,7 @@ BIOMARKER_SIM_SD = {
     "hrv_sdnn": 7.0,
     "respiratory_rate": 0.8,
     "oxygen_saturation": 0.6,
-    "body_temperature": 0.36,  # 0.2°C equivalent, scaled to °F (×9/5)
-    "sleep_duration": 0.7,  # hours, night-to-night variation
+    "body_temperature": 0.2,
 }
 
 # Minute-to-minute noise is smaller than day-to-day variation — expressed
@@ -525,12 +441,13 @@ def _generate_full_series(persona_id: int, marker_key: str) -> tuple:
     underlying walk — guaranteeing the visible tail of a 7-day view and a
     30-day view are identical, not two different random draws.
     """
+    patient = get_persona(persona_id)
     meta = BIOMARKER_META[marker_key]
     sd = BIOMARKER_SIM_SD[marker_key]
     precision = meta["precision"]
     n = BASELINE_WINDOW_DAYS
 
-    current = _anchor_value(persona_id, marker_key, meta)
+    current = float(patient[meta["field"]])
     offset = _today_offset(persona_id, marker_key, sd)
     history_mean = current - offset
     ramp = min(DEVIATION_RAMP_DAYS, n)
@@ -563,25 +480,28 @@ def get_biomarker_series(persona_id: int, marker_key: str, days: int = 30) -> li
 
 
 def get_intraday_series(persona_id: int, marker_key: str, interval_minutes: int = 10):
-    """Last 24 hours at `interval_minutes` resolution, ending at today's
-    real reading. Placeholder minute-level noise with mild mean reversion
-    so it doesn't wander over the simulated day. Returns
-    (minutes_since_midnight, values)."""
+    """Last 24 hours at `interval_minutes` resolution. Starts at yesterday's
+    daily reading and ends at today's real reading, so the 1-day view joins
+    up with the last step of the 7/14/30-day line. Placeholder noise on top.
+    Returns (minutes_since_midnight, values)."""
     meta = BIOMARKER_META[marker_key]
     sd = BIOMARKER_SIM_SD[marker_key] * INTRADAY_SD_FRACTION
     precision = meta["precision"]
-    real_value = _anchor_value(persona_id, marker_key, meta)
+    full = _generate_full_series(persona_id, marker_key)
+    start, end = full[-2], full[-1]
     rnd = random.Random(persona_id * 2000 + _stable_hash(marker_key))
 
     n = (24 * 60) // interval_minutes
     minutes = [i * interval_minutes for i in range(n)]
     values = []
-    val = real_value
-    for _ in range(n):
-        val += rnd.uniform(-sd, sd)
-        val += (real_value - val) * 0.05  # mild pull back toward today's real value
-        values.append(round(val, precision))
-    values[-1] = round(real_value, precision)  # "now" matches the real reading exactly
+    noise = 0.0
+    for i in range(n):
+        target = start + (end - start) * i / (n - 1)
+        noise += rnd.uniform(-sd, sd)
+        noise *= 0.9  # mean reversion keeps the noise around the target path
+        values.append(round(target + noise, precision))
+    values[0] = round(start, precision)
+    values[-1] = round(end, precision)
     return minutes, values
 
 
@@ -604,7 +524,6 @@ def get_biomarker(persona_id: int, marker_key: str, days: int = 30) -> dict:
         "unit": meta["unit"],
         "precision": meta["precision"],
         "higher_is_better": meta["higher_is_better"],
-        "fully_synthetic": meta.get("fully_synthetic", False),
         "current": current,
         "series": series,
         "observed_days": len(series),
@@ -635,7 +554,6 @@ def get_intraday_marker(persona_id: int, marker_key: str, interval_minutes: int 
         "precision": meta["precision"],
         "system": meta["system"],
         "higher_is_better": meta["higher_is_better"],
-        "fully_synthetic": meta.get("fully_synthetic", False),
         "minutes": minutes,
         "values": values,
         "baseline": baseline,
